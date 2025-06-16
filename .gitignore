@@ -10,6 +10,10 @@ log/
 # PDF文件
 *.pdf
 
+# 预处理代码和模型检查点
+HRRP_preprocessing/
+ckpt/
+
 # Python相关
 __pycache__/
 *.py[cod]
