@@ -46,8 +46,16 @@ class HrrpDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         item = {
-            "azimuth": self.data["azimuth"][idx],
-            "elevation": self.data["elevation"][idx],
+            "azimuth": (
+                self.data["azimuth"][idx].item()
+                if hasattr(self.data["azimuth"][idx], "item")
+                else self.data["azimuth"][idx]
+            ),
+            "elevation": (
+                self.data["elevation"][idx].item()
+                if hasattr(self.data["elevation"][idx], "item")
+                else self.data["elevation"][idx]
+            ),
             "distance": self.data["distance"][idx],
             "hrrp": self.data["hrrp"][idx],
             "class": self.data["class"][idx],

@@ -12,6 +12,7 @@ log/
 
 # 预处理代码和模型检查点
 HRRP_preprocessing/
+HRRP_preprocessing/*/
 ckpt/
 
 # Python相关
