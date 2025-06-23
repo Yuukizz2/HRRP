@@ -5,11 +5,14 @@ from pathlib import Path
 import logging
 import argparse
 import numpy as np
-from config.config import ModelConfig, TrainingConfig, DataConfig
-from model.contrastive_hrrp_model import ContrastiveHRRPModel, ClassificationHRRPModel
+import matplotlib.pyplot as plt
+import seaborn as sns
+from model.contrastive_hrrp_model import ContrastiveHRRPModel
 from model.tripletloss import CompositeTripletLoss
 from dataset.hrrp_dataset import HrrpDataset
-from utils.trainer import Trainer
+from utils.trainer import ContrastiveTrainer
+import datetime
+import os
 
 
 def setup_logging(log_dir: Path):
@@ -26,273 +29,152 @@ def setup_logging(log_dir: Path):
     return logging.getLogger(__name__)
 
 
-class ContrastiveTrainer:
-    """对比学习训练器"""
-
-    def __init__(
-        self,
-        model,
-        train_loader,
-        val_loader,
-        criterion,
-        optimizer,
-        scheduler,
-        device,
-        save_dir,
-        log_dir,
-        early_stopping_patience=10,
-    ):
-        self.model = model.to(device)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.criterion = criterion
-        self.optimizer = optimizer
-        self.scheduler = scheduler
-        self.device = device
-        self.save_dir = Path(save_dir)
-        self.log_dir = Path(log_dir)
-        self.early_stopping_patience = early_stopping_patience
-
-        # 创建保存目录
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-
-        # 设置日志
-        self.logger = logging.getLogger(__name__)
-
-        # 训练状态
-        self.best_val_loss = float("inf")
-        self.patience_counter = 0
-        self.epoch = 0
-        self.train_losses = []
-        self.val_losses = []
-
-    def train_epoch(self):
-        """训练一个epoch"""
-        self.model.train()
-        total_loss = 0.0
-        num_batches = 0
-
-        for batch in self.train_loader:
-            # 获取数据
-            hrrp_data = batch["hrrp"].to(self.device)
-            angles_data = torch.stack([batch["azimuth"], batch["elevation"]], dim=1).to(
-                self.device
-            )
-            labels = batch["class"].to(self.device)
-
-            # 前向传播
-            self.optimizer.zero_grad()
-
-            # 获取投影后的特征
-            projected_features = self.model(hrrp_data, angles_data)
-
-            # 计算角度信息（用于三元组损失）
-            # 这里我们使用方位角作为角度信息
-            angles_rad = torch.deg2rad(angles_data[:, 0])  # 使用方位角
-
-            # 计算对比学习损失
-            loss = self.criterion(projected_features, labels, angles_rad)
-
-            # 反向传播
-            loss.backward()
-            self.optimizer.step()
-
-            total_loss += loss.item()
-            num_batches += 1
-
-        return total_loss / num_batches
-
-    def validate_epoch(self):
-        """验证一个epoch"""
-        self.model.eval()
-        total_loss = 0.0
-        num_batches = 0
-
-        with torch.no_grad():
-            for batch in self.val_loader:
-                # 获取数据
-                hrrp_data = batch["hrrp"].to(self.device)
-                angles_data = torch.stack(
-                    [batch["azimuth"], batch["elevation"]], dim=1
-                ).to(self.device)
-                labels = batch["class"].to(self.device)
-
-                # 前向传播
-                projected_features = self.model(hrrp_data, angles_data)
-
-                # 计算角度信息
-                angles_rad = torch.deg2rad(angles_data[:, 0])
-
-                # 计算损失
-                loss = self.criterion(projected_features, labels, angles_rad)
-
-                total_loss += loss.item()
-                num_batches += 1
-
-        return total_loss / num_batches
-
-    def save_checkpoint(self, is_best=False):
-        """保存检查点"""
-        checkpoint = {
-            "epoch": self.epoch,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": (
-                self.scheduler.state_dict() if self.scheduler else None
-            ),
-            "best_val_loss": self.best_val_loss,
-            "train_losses": self.train_losses,
-            "val_losses": self.val_losses,
-        }
-
-        # 保存最新检查点
-        torch.save(checkpoint, self.save_dir / "contrastive_latest.pth")
-
-        # 保存最佳检查点
-        if is_best:
-            torch.save(checkpoint, self.save_dir / "contrastive_best.pth")
-            self.logger.info(f"保存最佳模型，验证损失: {self.best_val_loss:.4f}")
-
-    def train(self, num_epochs):
-        """训练模型"""
-        self.logger.info("开始对比学习训练...")
-
-        for epoch in range(num_epochs):
-            self.epoch = epoch
-
-            # 训练
-            train_loss = self.train_epoch()
-            self.train_losses.append(train_loss)
-
-            # 验证
-            val_loss = self.validate_epoch()
-            self.val_losses.append(val_loss)
-
-            # 学习率调度
-            if self.scheduler:
-                self.scheduler.step()
-
-            # 记录日志
-            self.logger.info(
-                f"Epoch {epoch+1}/{num_epochs} - "
-                f"Train Loss: {train_loss:.4f}, "
-                f"Val Loss: {val_loss:.4f}, "
-                f"LR: {self.optimizer.param_groups[0]['lr']:.6f}"
-            )
-
-            # 保存最佳模型
-            is_best = val_loss < self.best_val_loss
-            if is_best:
-                self.best_val_loss = val_loss
-                self.patience_counter = 0
-            else:
-                self.patience_counter += 1
-
-            # 保存检查点
-            self.save_checkpoint(is_best)
-
-            # 早停
-            if self.patience_counter >= self.early_stopping_patience:
-                self.logger.info(f"早停触发，在epoch {epoch+1}停止训练")
-                break
-
-        self.logger.info("对比学习训练完成！")
-
-
 def main(args):
     # 设置随机种子
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-
-    # 创建配置
-    model_config = ModelConfig()
-    training_config = TrainingConfig()
-    data_config = DataConfig()
-
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # 设置设备
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"使用设备: {device}")
+    
     # 设置日志
-    logger = setup_logging(Path(training_config.log_dir))
-    logger.info("开始对比学习训练...")
-
-    # 创建数据集
+    logger = setup_logging(Path(args.log_dir))
+    
+    key_params = {
+        "d_model": args.d_model,
+        "num_layers": args.num_layers,
+        "d_ff": args.d_ff,
+        "batch_size": args.batch_size,
+        "learning_rate": args.learning_rate,
+        "num_epochs": args.num_epochs,
+    }
+    logger.info(f"训练参数: {key_params}")
+    
+    # 加载数据
+    logger.info("加载数据集...")
     train_dataset = HrrpDataset(
-        data_path=data_config.train_data_path,
-        transform={"normalize": True, "augment": True},
+        data_path=args.train_data_path,
+        return_format="dict",
+        balance_classes=True  # 启用类别平衡
     )
     val_dataset = HrrpDataset(
-        data_path=data_config.val_data_path,
-        transform={"normalize": True, "augment": False},
+        data_path=args.val_data_path,
+        return_format="dict",
+        balance_classes=False
     )
-
+    
     # 创建数据加载器
+    train_sampler = train_dataset.get_sampler()
     train_loader = DataLoader(
         train_dataset,
-        batch_size=training_config.batch_size,
-        shuffle=True,
-        num_workers=data_config.num_workers,
-        pin_memory=data_config.pin_memory,
+        batch_size=args.batch_size,
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=training_config.batch_size,
+        batch_size=args.batch_size,
         shuffle=False,
-        num_workers=data_config.num_workers,
-        pin_memory=data_config.pin_memory,
+        num_workers=args.num_workers,
+        pin_memory=True
     )
-
-    # 创建对比学习模型
-    contrastive_model = ContrastiveHRRPModel(
-        hrrp_len=model_config.sequence_length,
-        feature_dim=model_config.d_model,
-        nhead=model_config.num_heads,
-        num_encoder_layers=model_config.num_layers,
-        dim_feedforward=model_config.d_ff,
-        projection_hidden_dim=256,
-        projection_output_dim=128,
+    
+    logger.info(f"训练集大小: {len(train_dataset)}")
+    logger.info(f"验证集大小: {len(val_dataset)}")
+    
+    # 创建模型
+    logger.info("创建模型...")
+    model = ContrastiveHRRPModel(
+        hrrp_len=args.sequence_length,
+        feature_dim=args.d_model,
+        nhead=args.num_heads,
+        num_encoder_layers=args.num_layers,
+        dim_feedforward=args.d_ff,
+        projection_hidden_dim=512,
+        projection_output_dim=256,
     )
-
-    # 创建复合三元组损失函数
+    
+    # 创建损失函数
     criterion = CompositeTripletLoss(
-        margin_class=1.0,  # 类间分离边距
-        margin_angular=0.2,  # 类内角度排序边距
-        lambda_angular=0.5,  # 角度损失权重
+        margin_class=1.0,
+        margin_angular=0.2,
+        lambda_angular=0.5
     )
-
-    # 创建优化器
+    
+    # 创建优化器（使用更小的学习率）
     optimizer = torch.optim.AdamW(
-        contrastive_model.parameters(),
-        lr=training_config.learning_rate,
-        weight_decay=training_config.weight_decay,
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.999)
     )
-
+    
     # 创建学习率调度器
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=training_config.num_epochs
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=5,
+        verbose=True,
+        min_lr=1e-6
     )
-
-    # 创建对比学习训练器
+    
+    # 创建训练器
     trainer = ContrastiveTrainer(
-        model=contrastive_model,
+        model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         criterion=criterion,
         optimizer=optimizer,
         scheduler=scheduler,
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        save_dir=training_config.save_dir,
-        log_dir=training_config.log_dir,
-        early_stopping_patience=training_config.early_stopping_patience,
+        device=device,
+        save_dir=args.save_dir,
+        log_dir=args.log_dir,
+        num_classes=args.num_classes,
+        early_stopping_patience=args.early_stopping_patience,
     )
-
+    
     # 开始训练
-    trainer.train(training_config.num_epochs)
-
-    logger.info("对比学习训练完成！")
+    trainer.train(args.num_epochs)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="对比学习训练HRRP模型")
-    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser = argparse.ArgumentParser(description="对比学习训练")
+    
+    # 数据参数
+    parser.add_argument("--train_data_path", type=str, default="data/train", help="训练数据路径")
+    parser.add_argument("--val_data_path", type=str, default="data/val", help="验证数据路径")
+    parser.add_argument("--sequence_length", type=int, default=512, help="序列长度")
+    parser.add_argument("--num_classes", type=int, default=8, help="类别数量")
+    
+    # 模型参数
+    parser.add_argument("--d_model", type=int, default=512, help="模型维度")
+    parser.add_argument("--num_layers", type=int, default=3, help="Transformer层数")
+    parser.add_argument("--num_heads", type=int, default=8, help="注意力头数")
+    parser.add_argument("--d_ff", type=int, default=1024, help="前馈网络维度")
+    
+    # 训练参数
+    parser.add_argument("--batch_size", type=int, default=32, help="批次大小")
+    parser.add_argument("--learning_rate", type=float, default=5e-4, help="学习率")
+    parser.add_argument("--num_epochs", type=int, default=50, help="训练轮数")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="权重衰减")
+    parser.add_argument("--early_stopping_patience", type=int, default=15, help="早停耐心值")
+    
+    # 其他参数
+    parser.add_argument("--num_workers", type=int, default=8, help="数据加载器工作进程数")
     args = parser.parse_args()
-    main(args)
+    
+    now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_root = os.path.join("logs", now)
+    save_root = os.path.join("ckpt", now)
+    os.makedirs(log_root, exist_ok=True)
+    os.makedirs(save_root, exist_ok=True)
+    args.log_dir = log_root
+    args.save_dir = save_root
+
+    
+
+    main(args) 

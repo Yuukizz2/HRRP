@@ -1,9 +1,9 @@
+from typing import Tuple, Optional, Dict, Any, Union
+import logging
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, WeightedRandomSampler
 import numpy as np
 from pathlib import Path
-from typing import Tuple, Optional, Dict, Any
-import logging
 
 
 class HrrpDataset(Dataset):
@@ -12,6 +12,8 @@ class HrrpDataset(Dataset):
         data_path: str,
         transform: Optional[Dict[str, Any]] = None,
         target_transform: Optional[Dict[str, Any]] = None,
+        return_format: str = "tuple",  # "tuple" 或 "dict"
+        balance_classes: bool = False,  # 是否平衡类别
     ):
         """
         HRRP数据集类
@@ -20,16 +22,22 @@ class HrrpDataset(Dataset):
             data_path: 数据路径
             transform: 数据增强配置
             target_transform: 标签转换配置
+            return_format: 返回格式，"tuple"返回(data, target)元组，"dict"返回字典
+            balance_classes: 是否平衡类别分布
         """
         self.data_path = Path(data_path)
-        self.transform = transform or {}
-        self.target_transform = target_transform or {}
+        self.return_format = return_format
+        self.balance_classes = balance_classes
 
         # 设置日志
         self.logger = logging.getLogger(__name__)
 
         # 加载数据
         self.data = self._load_data()
+        
+        # 如果启用类别平衡，计算采样权重
+        if self.balance_classes:
+            self.sample_weights = self._compute_sample_weights()
 
     def _load_data(self) -> Dict[str, torch.Tensor]:
         """加载数据"""
@@ -44,116 +52,72 @@ class HrrpDataset(Dataset):
     def __len__(self) -> int:
         return len(self.data["hrrp"])
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        item = {
-            "azimuth": (
-                self.data["azimuth"][idx].item()
-                if hasattr(self.data["azimuth"][idx], "item")
-                else self.data["azimuth"][idx]
-            ),
-            "elevation": (
-                self.data["elevation"][idx].item()
-                if hasattr(self.data["elevation"][idx], "item")
-                else self.data["elevation"][idx]
-            ),
-            "distance": self.data["distance"][idx],
-            "hrrp": self.data["hrrp"][idx],
-            "class": self.data["class"][idx],
-        }
-
-        # 应用数据增强
-        if self.transform.get("augment", False):
-            item["hrrp"] = self._augment_data(item["hrrp"])
-
-        return item
-
-    def _augment_data(self, data: torch.Tensor) -> torch.Tensor:
-        """数据增强"""
-        augmented_data = data.clone()
-
-        # 添加高斯噪声
-        if self.transform.get("add_noise", False):
-            noise = torch.randn_like(data) * self.transform.get("noise_std", 0.01)
-            augmented_data += noise
-
-        # 随机缩放
-        if self.transform.get("random_scale", False):
-            scale = 1.0 + torch.randn(1) * self.transform.get("scale_std", 0.1)
-            augmented_data *= scale
-
-        return augmented_data
-
-
-# # --- 示例数据 (请替换为你的真实数据) ---
-# # 假设你有100个HRRP样本，每个样本长度为64
-# num_samples = 100
-# sequence_length = 64
-# num_classes = 3  # 假设有3个类别
-
-# # 生成一些随机的HRRP信号数据
-# dummy_hrrp_signals = np.random.rand(num_samples, sequence_length).astype(np.float32)
-
-# # 生成一些随机的标签 (类别索引从0到num_classes-1)
-# dummy_labels = np.random.randint(0, num_classes, size=num_samples).astype(np.int64)
-
-# # --- 实例化 Dataset ---
-# # 通常你会将数据分为训练集、验证集和测试集
-# # 这里我们用所有虚拟数据创建一个训练集作为示例
-
-# # 假设你有一个transform函数（可选）
-# # def example_transform(sample):
-# #     # 例如，对信号进行归一化等操作
-# #     # sample['signal'] = (sample['signal'] - sample['signal'].mean()) / sample['signal'].std()
-# #     # return sample
-# #     # 或者更简单地，如果transform只作用于信号:
-# #     # signal = sample['signal']
-# #     # signal = (signal - signal.mean()) / signal.std()
-# #     # return signal, sample['label']
-# #     pass
+    def __getitem__(self, idx: int) -> Union[Tuple[torch.Tensor, torch.Tensor], Dict[str, Any]]:
+        """
+        返回单个样本
+        
+        Returns:
+            如果return_format="tuple": (hrrp_data, class_label)
+            如果return_format="dict": {"hrrp": ..., "azimuth": ..., "elevation": ..., "class": ...}
+        """
+        hrrp_data = self.data["hrrp"][idx]
+        class_label = self.data["class"][idx]
+        
+        # 确保class_label是正确的数据类型
+        if isinstance(class_label, torch.Tensor):
+            class_label = class_label.long()  # 确保是Long类型
+        else:
+            class_label = torch.tensor(class_label, dtype=torch.long)
+                           
+        if self.return_format == "tuple":
+            return hrrp_data, class_label
+        elif self.return_format == "dict":
+            return {
+                "azimuth": (
+                    self.data["azimuth"][idx].item()
+                    if hasattr(self.data["azimuth"][idx], "item")
+                    else self.data["azimuth"][idx]
+                ),
+                "elevation": (
+                    self.data["elevation"][idx].item()
+                    if hasattr(self.data["elevation"][idx], "item")
+                    else self.data["elevation"][idx]
+                ),
+                "distance": self.data["distance"][idx],
+                "hrrp": hrrp_data,
+                "class": class_label,
+            }
+        else:
+            raise ValueError(f"不支持的返回格式: {self.return_format}")
 
 
-# train_dataset = HrrpDataset(
-#     data_path="path_to_your_data", transform=None, target_transform=None
-# )  # 如果有transform，在这里传入
-
-# # 检查一个样本
-# single_signal, single_label = train_dataset[0]
-# print(f"单个HRRP信号形状: {single_signal.shape}, 类型: {single_signal.dtype}")
-# print(f"单个标签: {single_label}, 类型: {single_label.dtype}")
-# print("-" * 30)
-
-# # --- 2. 实例化 DataLoader ---
-# batch_size = 16  # 设置你想要的批次大小
-
-# train_dataloader = torch.DataLoader(
-#     train_dataset,
-#     batch_size=batch_size,
-#     shuffle=True,  # 在每个epoch开始时打乱数据，对训练集通常为True
-#     num_workers=0,  # 使用多少子进程加载数据。0表示在主进程中加载。
-#     # 在Windows上设为0通常更稳定，Linux/macOS可以尝试>0
-#     pin_memory=(
-#         True if torch.cuda.is_available() else False
-#     ),  # 如果使用GPU，可以加快数据传输
-# )
-
-# # --- 使用 DataLoader ---
-# # 迭代 DataLoader 获取数据批次
-# # 通常在训练循环中使用
-# print("从DataLoader中取出一个批次的数据:")
-# for i, batch in enumerate(train_dataloader):
-#     hrrp_batch, labels_batch = batch
-
-#     print(f"批次 {i+1}:")
-#     print(f"  HRRP信号批次形状: {hrrp_batch.shape}")  # (batch_size, sequence_length)
-#     print(f"  标签批次形状: {labels_batch.shape}")  # (batch_size,)
-#     print(f"  HRRP信号批次类型: {hrrp_batch.dtype}")
-#     print(f"  标签批次类型: {labels_batch.dtype}")
-
-#     # 在这里，你可以将 hrrp_batch 和 labels_batch 输入到你的模型中进行训练
-#     # model(hrrp_batch) ...
-
-#     if i == 0:  # 只演示第一个批次
-#         break
-
-# print("-" * 30)
-# print("DataLoader 构建完成并可供使用。")
+    def _compute_sample_weights(self):
+        """计算采样权重以平衡类别"""
+        labels = []
+        for i in range(len(self.data["class"])):
+            label = self.data["class"][i]
+            if isinstance(label, torch.Tensor):
+                labels.append(label.item())
+            else:
+                labels.append(label)
+        
+        labels = np.array(labels)
+        class_counts = np.bincount(labels)
+        
+        # 计算每个样本的权重（类别数量少的样本权重更高）
+        sample_weights = []
+        for label in labels:
+            weight = 1.0 / class_counts[label]
+            sample_weights.append(weight)
+        
+        return torch.tensor(sample_weights, dtype=torch.float)
+    
+    def get_sampler(self):
+        """获取加权采样器"""
+        if self.balance_classes:
+            return WeightedRandomSampler(
+                weights=self.sample_weights.tolist(),
+                num_samples=len(self.sample_weights),
+                replacement=True
+            )
+        return None
