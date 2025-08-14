@@ -1,4 +1,4 @@
-from typing import Tuple, Optional, Dict, Any, Union
+from typing import Tuple, Optional, Dict, Any, Union, List
 import logging
 import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
@@ -14,6 +14,7 @@ class HrrpDataset(Dataset):
         target_transform: Optional[Dict[str, Any]] = None,
         return_format: str = "tuple",  # "tuple" 或 "dict"
         balance_classes: bool = False,  # 是否平衡类别
+        allowed_classes: Optional[List[int]] = None,
     ):
         """
         HRRP数据集类
@@ -28,13 +29,16 @@ class HrrpDataset(Dataset):
         self.data_path = Path(data_path)
         self.return_format = return_format
         self.balance_classes = balance_classes
-
+        self.allowed_classes = allowed_classes
         # 设置日志
         self.logger = logging.getLogger(__name__)
 
         # 加载数据
         self.data = self._load_data()
         
+        if self.allowed_classes is not None:
+            self._filter_by_classes()
+            
         # 如果启用类别平衡，计算采样权重
         if self.balance_classes:
             self.sample_weights = self._compute_sample_weights()
@@ -48,6 +52,14 @@ class HrrpDataset(Dataset):
         except Exception as e:
             self.logger.error(f"Error loading data: {e}")
             raise
+
+    def _filter_by_classes(self):
+        """只保留属于 allowed_classes 的样本"""
+        indices = [i for i, label in enumerate(self.data["class"])
+                    if int(label) in self.allowed_classes]
+        for key in self.data:
+            self.data[key] = self.data[key][indices]
+
 
     def __len__(self) -> int:
         return len(self.data["hrrp"])

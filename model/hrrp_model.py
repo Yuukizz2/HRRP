@@ -56,23 +56,18 @@ class RotaryFusionLayer(nn.Module):
 
     def forward(self, feature_sequence, rotation_angles):
         # feature_sequence: (Batch, SeqLen, FeatureDim)
-        # rotation_angles: (Batch, 1)
+        # rotation_angles: (Batch, 1) or (Batch,)
 
-        # 将特征维度两两配对
         seq_even = feature_sequence[..., 0::2]  # (Batch, SeqLen, FeatureDim/2)
         seq_odd = feature_sequence[..., 1::2]  # (Batch, SeqLen, FeatureDim/2)
 
-        # 扩展旋转角度维度以进行广播
-        # -> (Batch, 1, 1)
-        cos_a = torch.cos(rotation_angles).unsqueeze(-1)
-        sin_a = torch.sin(rotation_angles).unsqueeze(-1)
+        cos_a = torch.cos(rotation_angles).unsqueeze(-1)  # (Batch, 1, 1)
+        sin_a = torch.sin(rotation_angles).unsqueeze(-1)  # (Batch, 1, 1)
 
-        # 应用旋转到序列中的每个时间步
-        # (Batch, SeqLen, FeatureDim/2) * (Batch, 1, 1) -> (Batch, SeqLen, FeatureDim/2)
+        # 应用旋转
         out_even = seq_even * cos_a - seq_odd * sin_a
         out_odd = seq_even * sin_a + seq_odd * cos_a
 
-        # 重新组合成完整维度的特征序列
         rotated_sequence = torch.zeros_like(feature_sequence)
         rotated_sequence[..., 0::2] = out_even
         rotated_sequence[..., 1::2] = out_odd
@@ -80,16 +75,32 @@ class RotaryFusionLayer(nn.Module):
         return rotated_sequence
 
 
-# 最终的完整模型
-class MyCustomModel(nn.Module):
+# # 模块四：投影头（用于对比学习）
+# class ProjectionHead(nn.Module):
+#     """对比学习中的投影头，将特征映射到对比学习空间"""
+
+#     def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1):
+#         super().__init__()
+#         self.projection = nn.Sequential(
+#             nn.Linear(input_dim, hidden_dim),
+#             nn.ReLU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(hidden_dim, output_dim),
+#         )
+
+#     def forward(self, x):
+#         return self.projection(x)
+
+class HRRPModel(nn.Module):
     def __init__(
         self,
         hrrp_len,
         feature_dim,
-        num_classes,
-        nhead=4,
-        num_encoder_layers=2,
-        dim_feedforward=512,
+        nhead=8,
+        num_encoder_layers=3,
+        dim_feedforward=1024,
+        # projection_hidden_dim=256,
+        # projection_output_dim=128,
     ):
         super().__init__()
 
@@ -104,7 +115,7 @@ class MyCustomModel(nn.Module):
         # 3. 旋转融合层
         self.rotary_fusion = RotaryFusionLayer()
 
-        # 4. Transformer分类器
+        # 4. Transformer编码器
         # 创建一个可学习的 [CLS] token
         self.cls_token = nn.Parameter(torch.randn(1, 1, feature_dim))
 
@@ -118,8 +129,12 @@ class MyCustomModel(nn.Module):
             encoder_layer, num_layers=num_encoder_layers
         )
 
-        # 5. 最终的分类头
-        self.mlp_head = nn.Linear(feature_dim, num_classes)
+        # # 5. 投影头（用于对比学习）
+        # self.projection_head = ProjectionHead(
+        #     input_dim=feature_dim,
+        #     hidden_dim=projection_hidden_dim,
+        #     output_dim=projection_output_dim,
+        # )
 
     def _encode_angles(self, angles):
         # angles: (Batch, 2) -> [[az, el], [az, el], ...]
@@ -129,7 +144,7 @@ class MyCustomModel(nn.Module):
         el_rad = angles_rad[:, 1]
 
         # 三角函数编码
-        return torch.stack(
+        encoded = torch.stack(
             [
                 torch.cos(az_rad),
                 torch.sin(az_rad),
@@ -138,8 +153,10 @@ class MyCustomModel(nn.Module):
             ],
             dim=-1,
         )
+        return encoded.float()
 
-    def forward(self, hrrp_signal, angles):
+    def forward_encoder(self, hrrp_signal, angles):
+        """编码器前向传播，返回特征表示"""
         # hrrp_signal: (Batch, SignalLength)
         # angles: (Batch, 2) -> [[az_deg, el_deg], ...]
 
@@ -149,6 +166,13 @@ class MyCustomModel(nn.Module):
         # 角度三角函数编码 -> (Batch, 4)
         angles_encoded = self._encode_angles(angles)
 
+        # 调试打印：输入数据统计（每100个batch）
+        if hasattr(self, 'debug_mode') and self.debug_mode and hasattr(self, 'batch_count'):
+            self.batch_count += 1
+            if self.batch_count % 100 == 0:
+                print(f"[DEBUG] Batch {self.batch_count} - HRRP信号统计 - 均值: {hrrp_signal.mean():.4f}, 标准差: {hrrp_signal.std():.4f}, 范围: [{hrrp_signal.min():.4f}, {hrrp_signal.max():.4f}]")
+                print(f"[DEBUG] Batch {self.batch_count} - 角度编码统计 - 均值: {angles_encoded.mean():.4f}, 标准差: {angles_encoded.std():.4f}")
+
         # 1. 角度通路：提取旋转角度因子
         rotation_theta = self.angle_mlp(angles_encoded)  # -> (Batch, 1)
 
@@ -157,15 +181,108 @@ class MyCustomModel(nn.Module):
             hrrp_signal
         )  # -> (Batch, SeqLen, FeatureDim)
 
+        # 调试打印：特征提取结果（每100个batch）
+        if hasattr(self, 'debug_mode') and self.debug_mode and hasattr(self, 'batch_count') and self.batch_count % 100 == 0:
+            print(f"[DEBUG] Batch {self.batch_count} - HRRP特征统计 - 均值: {hrrp_features.mean():.4f}, 标准差: {hrrp_features.std():.4f}")
+            print(f"[DEBUG] Batch {self.batch_count} - 旋转角度因子 - 均值: {rotation_theta.mean():.4f}, 标准差: {rotation_theta.std():.4f}")
+
         # 3. 融合：旋转特征序列
         rotated_features = self.rotary_fusion(hrrp_features, rotation_theta)
 
-        # 4. Transformer分类
+        # 4. Transformer编码
         # 准备输入给Transformer的序列
         batch_size = rotated_features.size(0)
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # 将CLS token复制B份
         transformer_input = torch.cat(
             (cls_tokens, rotated_features), dim=1
+        )  # -> (Batch, 1+SeqLen, FeatureDim)
+
+        # 调试打印：Transformer输入（每100个batch）
+        if hasattr(self, 'debug_mode') and self.debug_mode and hasattr(self, 'batch_count') and self.batch_count % 100 == 0:
+            print(f"[DEBUG] Batch {self.batch_count} - Transformer输入统计 - 均值: {transformer_input.mean():.4f}, 标准差: {transformer_input.std():.4f}")
+
+        # 通过Transformer编码器
+        transformer_output = self.transformer_encoder(
+            transformer_input
+        )  # -> (Batch, 1+SeqLen, FeatureDim)
+
+        # 提取 [CLS] token对应的输出作为整个序列的表示
+        cls_output = transformer_output[:, 0, :]  # -> (Batch, FeatureDim)
+
+        # 调试打印：最终特征（每100个batch）
+        if hasattr(self, 'debug_mode') and self.debug_mode and hasattr(self, 'batch_count') and self.batch_count % 100 == 0:
+            print(f"[DEBUG] Batch {self.batch_count} - 编码器输出特征统计 - 均值: {cls_output.mean():.4f}, 标准差: {cls_output.std():.4f}")
+            print(f"[DEBUG] Batch {self.batch_count} - 特征形状: {cls_output.shape}")
+
+        return cls_output
+
+    def forward(self, hrrp_signal, angles):
+        """完整的前向传播，返回投影后的特征"""
+        # 获取编码器输出
+        encoded_features = self.forward_encoder(hrrp_signal, angles)
+
+        # 通过投影头
+        # projected_features = self.projection_head(encoded_features)
+
+        # # 调试打印：投影后特征（每100个batch）
+        # if hasattr(self, 'debug_mode') and self.debug_mode and hasattr(self, 'batch_count') and self.batch_count % 100 == 0:
+        #     print(f"[DEBUG] Batch {self.batch_count} - 投影后特征统计 - 均值: {projected_features.mean():.4f}, 标准差: {projected_features.std():.4f}")
+        #     print(f"[DEBUG] Batch {self.batch_count} - 投影特征形状: {projected_features.shape}")
+        #     print(f"[DEBUG] Batch {self.batch_count} - 投影特征范数 - 均值: {torch.norm(projected_features, dim=1).mean():.4f}, 标准差: {torch.norm(projected_features, dim=1).std():.4f}")
+        #     print("-" * 50)
+
+        return encoded_features
+
+
+class SimplifiedHRRPModel(nn.Module):
+    """简化版HRRP模型，去掉角度融合模块，用于测试角度融合是否引入噪声"""
+    
+    def __init__(
+        self,
+        hrrp_len,
+        feature_dim,
+        nhead=8,
+        num_encoder_layers=3,
+        dim_feedforward=1024,
+    ):
+        super().__init__()
+
+        self.feature_dim = feature_dim
+
+        # 1. HRRP特征提取器
+        self.hrrp_extractor = HRRPExtractor(output_dim=feature_dim)
+
+        # 2. Transformer编码器
+        # 创建一个可学习的 [CLS] token
+        self.cls_token = nn.Parameter(torch.randn(1, 1, feature_dim))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=feature_dim,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_encoder_layers
+        )
+
+    def forward(self, hrrp_signal, angles=None):
+        """简化版前向传播，不使用角度信息"""
+        # hrrp_signal: (Batch, SignalLength)
+        # angles: 忽略，保持接口兼容性
+
+        # 0. 预处理：为1D CNN增加通道维度 -> (Batch, 1, SignalLength)
+        hrrp_signal = hrrp_signal.unsqueeze(1)
+
+        # 1. HRRP特征提取
+        hrrp_features = self.hrrp_extractor(hrrp_signal)  # -> (Batch, SeqLen, FeatureDim)
+
+        # 2. Transformer编码
+        # 准备输入给Transformer的序列
+        batch_size = hrrp_features.size(0)
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # 将CLS token复制B份
+        transformer_input = torch.cat(
+            (cls_tokens, hrrp_features), dim=1
         )  # -> (Batch, 1+SeqLen, FeatureDim)
 
         # 通过Transformer编码器
@@ -176,45 +293,4 @@ class MyCustomModel(nn.Module):
         # 提取 [CLS] token对应的输出作为整个序列的表示
         cls_output = transformer_output[:, 0, :]  # -> (Batch, FeatureDim)
 
-        # 5. 通过分类头得到最终结果
-        logits = self.mlp_head(cls_output)  # -> (Batch, NumClasses)
-
-        return logits
-
-
-# --- 使用示例 ---
-if __name__ == "__main__":
-    # 模型超参数
-    BATCH_SIZE = 4
-    HRRP_LENGTH = 512
-    FEATURE_DIM = 64  # 特征维度必须是偶数
-    NUM_CLASSES = 10
-
-    # 实例化模型
-    model = MyCustomModel(
-        hrrp_len=HRRP_LENGTH,
-        feature_dim=FEATURE_DIM,
-        num_classes=NUM_CLASSES,
-        nhead=4,
-        num_encoder_layers=2,
-    )
-
-    # 创建模拟输入数据
-    dummy_hrrp = torch.randn(BATCH_SIZE, HRRP_LENGTH)
-    dummy_angles = torch.tensor(
-        [[10.0, 20.0], [45.0, 30.0], [90.0, 5.0], [180.0, 15.0]]
-    )  # (Batch, 2)
-
-    print(f"输入HRRP形状: {dummy_hrrp.shape}")
-    print(f"输入角度形状: {dummy_angles.shape}\n")
-
-    # 前向传播
-    output_logits = model(dummy_hrrp, dummy_angles)
-
-    print(
-        f"模型输出Logits形状: {output_logits.shape}"
-    )  # 应该为 (BATCH_SIZE, NUM_CLASSES)
-
-    # 检查参数数量
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"模型总参数量: {total_params:,}")
+        return cls_output

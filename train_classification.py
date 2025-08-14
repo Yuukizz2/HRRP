@@ -394,7 +394,7 @@ if __name__ == "__main__":
     # 训练参数
     parser.add_argument("--batch_size", type=int, default=32, help="批次大小")
     parser.add_argument("--learning_rate", type=float, default=1e-3, help="学习率")
-    parser.add_argument("--num_epochs", type=int, default=50, help="训练轮数")
+    parser.add_argument("--num_epochs", type=int, default=1, help="训练轮数")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="权重衰减")
     parser.add_argument(
         "--early_stopping_patience", type=int, default=15, help="早停耐心值"
