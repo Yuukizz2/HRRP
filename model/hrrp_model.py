@@ -41,8 +41,29 @@ class AngleMLP(nn.Module):
             nn.Linear(4, 64), nn.ReLU(), nn.Linear(64, 1)  # 输出一个标量作为旋转角度
         )
 
-    def forward(self, angles_encoded):
+    def _encode_angles(self, angles):
+    # angles: (Batch, 2) -> [[az, el], [az, el], ...]
+    # 转换为弧度
+        angles_rad = torch.deg2rad(angles)
+        az_rad = angles_rad[:, 0]
+        el_rad = angles_rad[:, 1]
+
+        # 三角函数编码
+        encoded = torch.stack(
+            [
+                torch.cos(az_rad),
+                torch.sin(az_rad),
+                torch.cos(el_rad),
+                torch.sin(el_rad),
+            ],
+            dim=-1,
+        )
+        return encoded.float()
+    
+    def forward(self, angles):
+        angles_encoded = self._encode_angles(angles)
         # 输入 angles_encoded: (Batch, 4)
+        
         rotation_angle = self.mlp(angles_encoded)
         return rotation_angle
 
@@ -56,15 +77,33 @@ class RotaryFusionLayer(nn.Module):
 
     def forward(self, feature_sequence, rotation_angles):
         # feature_sequence: (Batch, SeqLen, FeatureDim)
-        # rotation_angles: (Batch, 1) or (Batch,)
+        # rotation_angles: (Batch, 1) or (Batch,) or may contain extra singleton dims like (Batch,1,1,1)
+
+        # 形状与数值健壮性检查
+        assert feature_sequence.dim() == 3, f"feature_sequence 应为3维 (B, S, D)，实际为 {feature_sequence.shape}"
+        assert feature_sequence.size(-1) % 2 == 0, f"FeatureDim 必须为偶数，实际为 {feature_sequence.size(-1)}"
+        batch_size, seq_len, feat_dim = feature_sequence.shape
+
+        # 将 rotation_angles 规范为 (B, 1, 1)
+        # 兼容多余的1维，如 (B,1,1,1)
+        if rotation_angles.dim() > 2:
+            rotation_angles = rotation_angles.view(batch_size, -1)
+        if rotation_angles.dim() == 2 and rotation_angles.size(1) > 1:
+            rotation_angles = rotation_angles[:, :1]
+        if rotation_angles.dim() == 2 and rotation_angles.size(1) == 1:
+            rotation_angles = rotation_angles.squeeze(1)
+        if rotation_angles.dim() == 0:
+            rotation_angles = rotation_angles.unsqueeze(0)
+        assert rotation_angles.dim() in (1, 2), f"rotation_angles 维度应为1或2，实际为 {rotation_angles.shape}"
+        rotation_angles = rotation_angles.view(batch_size, 1, 1)
 
         seq_even = feature_sequence[..., 0::2]  # (Batch, SeqLen, FeatureDim/2)
         seq_odd = feature_sequence[..., 1::2]  # (Batch, SeqLen, FeatureDim/2)
 
-        cos_a = torch.cos(rotation_angles).unsqueeze(-1)  # (Batch, 1, 1)
-        sin_a = torch.sin(rotation_angles).unsqueeze(-1)  # (Batch, 1, 1)
+        cos_a = torch.cos(rotation_angles)  # (Batch, 1, 1)
+        sin_a = torch.sin(rotation_angles)  # (Batch, 1, 1)
 
-        # 应用旋转
+        # 应用旋转（利用广播到 (B, S, D/2)）
         out_even = seq_even * cos_a - seq_odd * sin_a
         out_odd = seq_even * sin_a + seq_odd * cos_a
 
@@ -136,25 +175,7 @@ class HRRPModel(nn.Module):
         #     output_dim=projection_output_dim,
         # )
 
-    def _encode_angles(self, angles):
-        # angles: (Batch, 2) -> [[az, el], [az, el], ...]
-        # 转换为弧度
-        angles_rad = torch.deg2rad(angles)
-        az_rad = angles_rad[:, 0]
-        el_rad = angles_rad[:, 1]
-
-        # 三角函数编码
-        encoded = torch.stack(
-            [
-                torch.cos(az_rad),
-                torch.sin(az_rad),
-                torch.cos(el_rad),
-                torch.sin(el_rad),
-            ],
-            dim=-1,
-        )
-        return encoded.float()
-
+    
     def forward_encoder(self, hrrp_signal, angles):
         """编码器前向传播，返回特征表示"""
         # hrrp_signal: (Batch, SignalLength)
@@ -163,18 +184,9 @@ class HRRPModel(nn.Module):
         # 0. 预处理
         # 为1D CNN增加通道维度 -> (Batch, 1, SignalLength)
         hrrp_signal = hrrp_signal.unsqueeze(1)
-        # 角度三角函数编码 -> (Batch, 4)
-        angles_encoded = self._encode_angles(angles)
-
-        # 调试打印：输入数据统计（每100个batch）
-        if hasattr(self, 'debug_mode') and self.debug_mode and hasattr(self, 'batch_count'):
-            self.batch_count += 1
-            if self.batch_count % 100 == 0:
-                print(f"[DEBUG] Batch {self.batch_count} - HRRP信号统计 - 均值: {hrrp_signal.mean():.4f}, 标准差: {hrrp_signal.std():.4f}, 范围: [{hrrp_signal.min():.4f}, {hrrp_signal.max():.4f}]")
-                print(f"[DEBUG] Batch {self.batch_count} - 角度编码统计 - 均值: {angles_encoded.mean():.4f}, 标准差: {angles_encoded.std():.4f}")
 
         # 1. 角度通路：提取旋转角度因子
-        rotation_theta = self.angle_mlp(angles_encoded)  # -> (Batch, 1)
+        rotation_theta = self.angle_mlp(angles)  # -> (Batch, 1)
 
         # 2. HRRP通路：提取特征序列
         hrrp_features = self.hrrp_extractor(
@@ -214,12 +226,12 @@ class HRRPModel(nn.Module):
             print(f"[DEBUG] Batch {self.batch_count} - 编码器输出特征统计 - 均值: {cls_output.mean():.4f}, 标准差: {cls_output.std():.4f}")
             print(f"[DEBUG] Batch {self.batch_count} - 特征形状: {cls_output.shape}")
 
-        return cls_output
+        return cls_output, hrrp_features, rotated_features
 
     def forward(self, hrrp_signal, angles):
         """完整的前向传播，返回投影后的特征"""
         # 获取编码器输出
-        encoded_features = self.forward_encoder(hrrp_signal, angles)
+        encoded_features, hrrp_features, rotated_features = self.forward_encoder(hrrp_signal, angles)
 
         # 通过投影头
         # projected_features = self.projection_head(encoded_features)
@@ -231,7 +243,7 @@ class HRRPModel(nn.Module):
         #     print(f"[DEBUG] Batch {self.batch_count} - 投影特征范数 - 均值: {torch.norm(projected_features, dim=1).mean():.4f}, 标准差: {torch.norm(projected_features, dim=1).std():.4f}")
         #     print("-" * 50)
 
-        return encoded_features
+        return encoded_features, hrrp_features, rotated_features
 
 
 class SimplifiedHRRPModel(nn.Module):
